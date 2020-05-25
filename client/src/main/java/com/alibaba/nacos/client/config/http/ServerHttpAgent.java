@@ -207,8 +207,10 @@ public class ServerHttpAgent implements HttpAgent {
                     return result;
                 }
             } catch (ConnectException ce) {
+                ce.printStackTrace();
                 LOGGER.error("[NACOS ConnectException httpDelete] currentServerAddr:{}, err : {}", serverListMgr.getCurrentServerAddr(), ce.getMessage());
             } catch (SocketTimeoutException stoe) {
+                stoe.printStackTrace();
                 LOGGER.error("[NACOS SocketTimeoutException httpDelete] currentServerAddr:{}， err : {}", serverListMgr.getCurrentServerAddr(), stoe.getMessage());
             } catch (IOException ioe) {
                 LOGGER.error("[NACOS IOException httpDelete] currentServerAddr: " + serverListMgr.getCurrentServerAddr(), ioe);
@@ -232,7 +234,9 @@ public class ServerHttpAgent implements HttpAgent {
     }
 
     private String getUrl(String serverAddr, String relativePath) {
-        return serverAddr + "/" + serverListMgr.getContentPath() + relativePath;
+        String contextPath = serverListMgr.getContentPath().startsWith("/") ?
+                serverListMgr.getContentPath() : "/" + serverListMgr.getContentPath();
+        return serverAddr + contextPath + relativePath;
     }
 
     public static String getAppname() {

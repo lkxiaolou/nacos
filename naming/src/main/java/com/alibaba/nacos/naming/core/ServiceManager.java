@@ -21,34 +21,50 @@ import com.alibaba.fastjson.JSONObject;
 import com.alibaba.nacos.api.common.Constants;
 import com.alibaba.nacos.api.exception.NacosException;
 import com.alibaba.nacos.api.naming.utils.NamingUtils;
-import com.alibaba.nacos.naming.cluster.ServerListManager;
-import com.alibaba.nacos.naming.cluster.servers.Server;
+import com.alibaba.nacos.core.cluster.Member;
+import com.alibaba.nacos.core.cluster.ServerMemberManager;
 import com.alibaba.nacos.naming.consistency.ConsistencyService;
 import com.alibaba.nacos.naming.consistency.Datum;
 import com.alibaba.nacos.naming.consistency.KeyBuilder;
 import com.alibaba.nacos.naming.consistency.RecordListener;
 import com.alibaba.nacos.naming.consistency.persistent.raft.RaftPeer;
 import com.alibaba.nacos.naming.consistency.persistent.raft.RaftPeerSet;
-import com.alibaba.nacos.naming.misc.*;
+import com.alibaba.nacos.naming.misc.GlobalExecutor;
+import com.alibaba.nacos.naming.misc.Loggers;
+import com.alibaba.nacos.naming.misc.Message;
+import com.alibaba.nacos.naming.misc.NamingProxy;
+import com.alibaba.nacos.naming.misc.NetUtils;
+import com.alibaba.nacos.naming.misc.ServiceStatusSynchronizer;
+import com.alibaba.nacos.naming.misc.SwitchDomain;
+import com.alibaba.nacos.naming.misc.Synchronizer;
+import com.alibaba.nacos.naming.misc.UtilsAndCommons;
 import com.alibaba.nacos.naming.push.PushService;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import org.apache.commons.lang3.ArrayUtils;
-import org.apache.commons.lang3.StringUtils;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.context.annotation.DependsOn;
-import org.springframework.stereotype.Component;
-import org.springframework.util.CollectionUtils;
-
-import javax.annotation.PostConstruct;
-import javax.annotation.Resource;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.StringJoiner;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import javax.annotation.PostConstruct;
+import javax.annotation.Resource;
+import org.apache.commons.lang3.ArrayUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.DependsOn;
+import org.springframework.stereotype.Component;
+import org.springframework.util.CollectionUtils;
 
 /**
  * Core manager storing all services in Nacos
@@ -56,7 +72,6 @@ import java.util.stream.Collectors;
  * @author nkorange
  */
 @Component
-@DependsOn("nacosApplicationContext")
 public class ServiceManager implements RecordListener<Service> {
 
     /**
@@ -80,7 +95,7 @@ public class ServiceManager implements RecordListener<Service> {
     private DistroMapper distroMapper;
 
     @Autowired
-    private ServerListManager serverListManager;
+    private ServerMemberManager memberManager;
 
     @Autowired
     private PushService pushService;
@@ -88,7 +103,18 @@ public class ServiceManager implements RecordListener<Service> {
     @Autowired
     private RaftPeerSet raftPeerSet;
 
+    @Value("${nacos.naming.empty-service.auto-clean:false}")
+    private boolean emptyServiceAutoClean;
+
+    private int maxFinalizeCount = 3;
+
     private final Object putServiceLock = new Object();
+
+    @Value("${nacos.naming.empty-service.clean.initial-delay-ms:60000}")
+    private int cleanEmptyServiceDelay;
+
+    @Value("${nacos.naming.empty-service.clean.period-time-ms:20000}")
+    private int cleanEmptyServicePeriod;
 
     @PostConstruct
     public void init() {
@@ -96,6 +122,19 @@ public class ServiceManager implements RecordListener<Service> {
         UtilsAndCommons.SERVICE_SYNCHRONIZATION_EXECUTOR.schedule(new ServiceReporter(), 60000, TimeUnit.MILLISECONDS);
 
         UtilsAndCommons.SERVICE_UPDATE_EXECUTOR.submit(new UpdatedServiceProcessor());
+
+        if (emptyServiceAutoClean) {
+
+            Loggers.SRV_LOG.info("open empty service auto clean job, initialDelay : {} ms, period : {} ms", cleanEmptyServiceDelay, cleanEmptyServicePeriod);
+
+            // delay 60s, period 20s;
+
+            // This task is not recommended to be performed frequently in order to avoid
+            // the possibility that the service cache information may just be deleted
+            // and then created due to the heartbeat mechanism
+
+            GlobalExecutor.scheduleServiceAutoClean(new EmptyServiceAutoClean(), cleanEmptyServiceDelay, cleanEmptyServicePeriod);
+        }
 
         try {
             Loggers.SRV_LOG.info("listen for service meta change");
@@ -227,61 +266,6 @@ public class ServiceManager implements RecordListener<Service> {
                     serviceName, serverIP, e);
             }
         }
-    }
-
-    public int getPagedClusterState(String namespaceId, int startPage, int pageSize, String keyword, List<RaftPeer> raftPeerList) {
-
-        List<RaftPeer> matchList = new ArrayList<>();
-        RaftPeer localRaftPeer = raftPeerSet.local();
-        matchList.add(localRaftPeer);
-        Set<String> otherServerSet = raftPeerSet.allServersWithoutMySelf();
-        if (null != otherServerSet && otherServerSet.size() > 0) {
-            for (String server: otherServerSet) {
-                String path =  UtilsAndCommons.NACOS_NAMING_OPERATOR_CONTEXT + UtilsAndCommons.NACOS_NAMING_CLUSTER_CONTEXT + "/state";
-                Map<String, String> params = Maps.newHashMapWithExpectedSize(2);
-                try {
-                    String content = NamingProxy.reqCommon(path, params, server, false);
-                    if (!StringUtils.EMPTY.equals(content)) {
-                        RaftPeer raftPeer = JSONObject.parseObject(content, RaftPeer.class);
-                        if (null != raftPeer) {
-                            matchList.add(raftPeer);
-                        }
-                    }
-                } catch (Exception e) {
-                    Loggers.SRV_LOG.warn("[QUERY-CLUSTER-STATE] Exception while query cluster state from {}, error: {}",
-                        server, e);
-                }
-            }
-        }
-        List<RaftPeer> tempList = new ArrayList<>();
-        if (StringUtils.isNotBlank(keyword)) {
-            for (RaftPeer raftPeer : matchList) {
-                String ip = raftPeer.ip.split(":")[0];
-                if (keyword.equals(ip)) {
-                    tempList.add(raftPeer);
-                }
-            }
-            matchList = tempList;
-        }
-
-        if (pageSize >= matchList.size()) {
-            raftPeerList.addAll(matchList);
-            return matchList.size();
-        }
-
-        for (int i = 0; i < matchList.size(); i++) {
-            if (i < startPage * pageSize) {
-                continue;
-            }
-
-            raftPeerList.add(matchList.get(i));
-
-            if (raftPeerList.size() >= pageSize) {
-                break;
-            }
-        }
-
-        return matchList.size();
     }
 
     public RaftPeer getMySelfClusterState() {
@@ -765,8 +749,60 @@ public class ServiceManager implements RecordListener<Service> {
                     serviceName, checksum);
                 return;
             }
-
             serviceName2Checksum.put(serviceName, checksum);
+        }
+    }
+
+
+    private class EmptyServiceAutoClean implements Runnable {
+
+        @Override
+        public void run() {
+
+            // Parallel flow opening threshold
+
+            int parallelSize = 100;
+
+            serviceMap.forEach((namespace, stringServiceMap) -> {
+                Stream<Map.Entry<String, Service>> stream = null;
+                if (stringServiceMap.size() > parallelSize) {
+                    stream = stringServiceMap.entrySet().parallelStream();
+                } else {
+                    stream = stringServiceMap.entrySet().stream();
+                }
+                stream
+                        .filter(entry -> {
+                            final String serviceName = entry.getKey();
+                            return distroMapper.responsible(serviceName);
+                        })
+                        .forEach(entry -> stringServiceMap.computeIfPresent(entry.getKey(), (serviceName, service) -> {
+                    if (service.isEmpty()) {
+
+                        // To avoid violent Service removal, the number of times the Service
+                        // experiences Empty is determined by finalizeCnt, and if the specified
+                        // value is reached, it is removed
+
+                        if (service.getFinalizeCount() > maxFinalizeCount) {
+                            Loggers.SRV_LOG.warn("namespace : {}, [{}] services are automatically cleaned",
+                                    namespace, serviceName);
+                            try {
+                                easyRemoveService(namespace, serviceName);
+                            } catch (Exception e) {
+                                Loggers.SRV_LOG.error("namespace : {}, [{}] services are automatically clean has " +
+                                        "error : {}", namespace, serviceName, e);
+                            }
+                        }
+
+                        service.setFinalizeCount(service.getFinalizeCount() + 1);
+
+                        Loggers.SRV_LOG.debug("namespace : {}, [{}] The number of times the current service experiences " +
+                                "an empty instance is : {}", namespace, serviceName, service.getFinalizeCount());
+                    } else {
+                        service.setFinalizeCount(0);
+                    }
+                    return service;
+                }));
+            });
         }
     }
 
@@ -794,7 +830,7 @@ public class ServiceManager implements RecordListener<Service> {
 
                         Service service = getService(namespaceId, serviceName);
 
-                        if (service == null) {
+                        if (service == null || service.isEmpty()) {
                             continue;
                         }
 
@@ -807,17 +843,17 @@ public class ServiceManager implements RecordListener<Service> {
 
                     msg.setData(JSON.toJSONString(checksum));
 
-                    List<Server> sameSiteServers = serverListManager.getServers();
+                    Collection<Member> sameSiteServers = memberManager.allMembers();
 
                     if (sameSiteServers == null || sameSiteServers.size() <= 0) {
                         return;
                     }
 
-                    for (Server server : sameSiteServers) {
-                        if (server.getKey().equals(NetUtils.localServer())) {
+                    for (Member server : sameSiteServers) {
+                        if (server.getAddress().equals(NetUtils.localServer())) {
                             continue;
                         }
-                        synchronizer.send(server.getKey(), msg);
+                        synchronizer.send(server.getAddress(), msg);
                     }
                 }
             } catch (Exception e) {

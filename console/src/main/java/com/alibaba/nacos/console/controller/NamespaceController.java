@@ -15,9 +15,9 @@
  */
 package com.alibaba.nacos.console.controller;
 
-import com.alibaba.nacos.config.server.model.RestResult;
+import com.alibaba.nacos.common.model.RestResult;
 import com.alibaba.nacos.config.server.model.TenantInfo;
-import com.alibaba.nacos.config.server.service.PersistService;
+import com.alibaba.nacos.config.server.service.repository.PersistService;
 import com.alibaba.nacos.console.model.Namespace;
 import com.alibaba.nacos.console.model.NamespaceAllInfo;
 import com.alibaba.nacos.console.security.nacos.NacosAuthConfig;
@@ -58,7 +58,6 @@ public class NamespaceController {
      * @return namespace list
      */
     @GetMapping
-    @Secured(resource = NacosAuthConfig.CONSOLE_RESOURCE_NAME_PREFIX + "namespaces", action = ActionTypes.READ)
     public RestResult<List<Namespace>> getNamespaces(HttpServletRequest request, HttpServletResponse response) {
         RestResult<List<Namespace>> rr = new RestResult<List<Namespace>>();
         rr.setCode(200);
@@ -86,7 +85,6 @@ public class NamespaceController {
      * @return namespace all info
      */
     @GetMapping(params = "show=all")
-    @Secured(resource = NacosAuthConfig.CONSOLE_RESOURCE_NAME_PREFIX + "namespaces", action = ActionTypes.READ)
     public NamespaceAllInfo getNamespace(HttpServletRequest request, HttpServletResponse response,
                                          @RequestParam("namespaceId") String namespaceId) {
         // TODO 获取用kp
@@ -144,7 +142,6 @@ public class NamespaceController {
      * @return java.lang.Boolean
      */
     @GetMapping(params = "checkNamespaceIdExist=true")
-    @Secured(resource = NacosAuthConfig.CONSOLE_RESOURCE_NAME_PREFIX + "namespaces", action = ActionTypes.READ)
     public Boolean checkNamespaceIdExist(@RequestParam("customNamespaceId") String namespaceId){
         if(StringUtils.isBlank(namespaceId)){
             return false;
